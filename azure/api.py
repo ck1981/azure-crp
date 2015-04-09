@@ -75,6 +75,7 @@ class BaseAzureClient(requests.Session):
     def request(self, *args, **kwargs):
         retry_count = kwargs.pop('retry_count', DEFAULT_RETRY_COUNT)
         retry_delay = kwargs.pop('retry_delay', DEFAULT_RETRY_DELAY)
+        suppress_errors = kwargs.pop("suppress_errors", [])
 
         res = super().request(*args, **kwargs)
         logger.debug("%s: %s",  " ".join(args), res.status_code)
@@ -92,6 +93,10 @@ class BaseAzureClient(requests.Session):
         try:
             res.raise_for_status()
         except requests.exceptions.HTTPError:
+            if res.status_code in suppress_errors:
+                logger.info("Received suppressed error (status: %s in %s)", res.status_code, suppress_errors)
+                return
+
             logger.warning("Received error (status: %s)", res.status_code)
 
             if retry_count <= 0:
@@ -103,7 +108,7 @@ class BaseAzureClient(requests.Session):
 
             retry_count -=1
             retry_delay *= RETRY_BACKOFF_FACTOR
-            kwargs.update(retry_count=retry_count, retry_delay=retry_delay)
+            kwargs.update(retry_count=retry_count, retry_delay=retry_delay, suppress_errors=suppress_errors)
 
             logger.debug("Retrying in %ss, retries left: %s", retry_delay, retry_count)
             time.sleep(retry_delay)
@@ -266,7 +271,7 @@ class AzureSubscriptionClient(AzureCrpClient):
     def list_role_definitions(self):
         return self.list("{subscription.uri}/providers/Microsoft.Authorization/roleDefinitions/".format(subscription=self._subscription()))
 
-    def grant_role_to_service_principal(self, roleDefinitionId, servicePrincipalId):
+    def grant_role_to_service_principal(self, roleDefinitionId, servicePrincipalId, **kwargs):
         return self.put(
             "{subscription.uri}/providers/Microsoft.Authorization/roleAssignments/{roleAssignmentId}".format(subscription=self._subscription(), roleAssignmentId=uuid.uuid4()),
             json={
@@ -275,7 +280,7 @@ class AzureSubscriptionClient(AzureCrpClient):
                 "principalId": servicePrincipalId
 
             }
-        })
+        }, **kwargs)
 
     # Generic methods
     def delete_generic(self, obj):

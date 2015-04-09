@@ -7,7 +7,7 @@ from azure.api import SERVICE_MANAGEMENT_RESOURCE, AD_RESOURCE, AzureCrpClient, 
     AzureSubscriptionClient, AzureObject
 
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("azure-authenticate")
 
 
 
@@ -15,33 +15,27 @@ class CandidateSubscription(object):
     """
     A subscription we want to prompt the user to grant access to.
     """
-    def __init__(self, tenant, subscription):
+    def __init__(self, tenant, subscription, creds):
         self.tenant = tenant
         self.subscription = subscription
+        self.creds = creds
 
 
-def prompt_for_access_on_subscriptions(app, extra, candidates):
+def maybe_add_access(app, subscription_id, candidates):
     for candidate in candidates:
-        logger.info("Trying subscription: %s (%s)", candidate.subscription.subscriptionId,
-                    candidate.subscription.displayName)
-
         if candidate.subscription.state == "Disabled":
-            logger.warning("Skipping %s: subscription is disabled", candidate.subscription.subscriptionId)
+            logger.debug("Skipping %s (%s): subscription is disabled", candidate.subscription.displayName,
+                         candidate.subscription.subscriptionId)
             continue
 
-        # This is meant to run in Python 3.
-        register = None
-        while register is None:
-            r = input(" Do you want to add '{0} ({1})'? [y/n]".format(candidate.subscription.subscriptionId,
-                                                                      candidate.subscription.displayName))
-            register = {"y": True, "n": False}.get(r.lower())
-
-        if not register:
-            logger.debug("Skipping subscription: %s", candidate.subscription.subscriptionId)
+        if candidate.subscription.subscriptionId != subscription_id:
+            logger.debug("Skipping %s (%s): does not match query (%s)", candidate.subscription.displayName,
+                         candidate.subscription.subscriptionId, subscription_id)
             continue
 
-        logger.info("Registering app for access to subscription: %s", candidate.subscription.subscriptionId)
-        add_access_on_subscription(app, extra, candidate)
+        logger.info("Registering app for access to subscription: %s (%s)", candidate.subscription.displayName,
+                    candidate.subscription.subscriptionId)
+        add_access_on_subscription(app, candidate)
 
         # A Subscription was registered
         return True
@@ -50,15 +44,16 @@ def prompt_for_access_on_subscriptions(app, extra, candidates):
     return False
 
 
-def add_access_on_subscription(app, extra, candidate):
-    # Get admin credentials
-    sm_credentials, ad_credentials = get_admin_credentials(app, candidate.tenant, extra)
+def add_access_on_subscription(app, candidate):
+    # Client to access the Service Management API
+    sm_client = AzureSubscriptionClient(candidate.subscription, candidate.creds)
 
-    sm_client = AzureSubscriptionClient(candidate.subscription, sm_credentials)
-    ad_client = AzureGraphClient(candidate.tenant, ad_credentials)
+    # Client to access the AD API. It's important to note that WE USE THE APP'S CREDENTIALS. NOT THE USER's.
+    # This lets us get away with one less permission (read directory data is no longer needed), and means we don't
+    # have to ask for admin_consent (which read directory data requires).
+    ad_creds = app.get_app_token(candidate.tenant.tenantId, AD_RESOURCE)
+    ad_client = AzureGraphClient(candidate.tenant, ad_creds)
 
-    # The service principal API should let me get the ID of the app's Service Principal in that directory.
-    # It should exist assuming directory access has been granted.
     service_principal = ad_client.list_service_principals(filter="appId eq '{0}'".format(app.app_client_id))[0]
 
     # Grant access!
@@ -66,49 +61,54 @@ def add_access_on_subscription(app, extra, candidate):
         if role.properties.roleName == "Contributor":
             sm_client.grant_role_to_service_principal(
                 role.id,
-                service_principal.objectId
+                service_principal.objectId,
+                suppress_errors=[409],  # 409 conflict means the role was already added
             )
             break
     else:
         raise Exception("Panic! Did not find Contributor Role")
 
 
-def get_admin_credentials(app, tenant, extra):
-    # Do I need to ask twice? Does it not use what is requested when the app is created?
-    sm_credentials = app.get_credentials_for_resource(tenant.tenantId, SERVICE_MANAGEMENT_RESOURCE,
-                                                             prompt="admin_consent", **extra)
-    ad_credentials = app.get_credentials_for_resource(tenant.tenantId, AD_RESOURCE, prompt="admin_consent",
-                                                      **extra)
-    return sm_credentials, ad_credentials
-
-
-
-
-def main(app_client_id, app_client_secret, live):
+def main(app_client_id, app_client_secret, subscription_id, live, directory):
     """
     Add the app as a Service Principal in Azure.
     """
+
+    # App needs permissions:
+    # - AD: Enable sign-on and read users' profiles
+    # - Service Management: Access Azure Service Management (Preview)
     app = AzureApp(app_client_id, app_client_secret)
 
     # If the user is a live.com user (i.e. a Microsoft account, not an organization account), then we need to pass
     # a "domain_hint" as an additional query argument in our OAuth token request. Otherwise, Azure will get confused
-    # and tell the user their credentials are wrong / they can't login (wtf wtf wtf).
-    # NOTE: THis is what Azure tells me, but in practice it seems to sometimes work without the hint...!
+    # and tell the user their credentials are wrong / they can't login.
     extra = {"domain_hint": "live.com"} if live else {}
 
+    # Furthermore, if the user is a live.com user, we cannot use the "common" endpoint (i.e. the "default directory"),
+    # and we MUST provide the tenant name / ID. The only way to do that is to ask the user for it.
+    if directory is None:
+        if live:
+            raise Exception("Cannot use --live without --directory!")
+        directory = "common"
+
     # Step 1: Get Service Management credentials for the User's default Tenant ("common").
-    default_tenant = AzureObject({"tenantId": "common"})
-    sm_generic_credentials = app.get_credentials_for_resource(default_tenant.tenantId, SERVICE_MANAGEMENT_RESOURCE,
+    default_tenant = AzureObject({"tenantId": directory})
+    default_tenant_creds = app.get_credentials_for_resource(default_tenant.tenantId, SERVICE_MANAGEMENT_RESOURCE,
                                                               **extra)
 
     # Step 1.a: OPTIONAL - Try the subscriptions on that tenant.
-    prompt_for_access_on_subscriptions(app, extra, [
-        CandidateSubscription(default_tenant, subscription)
-        for subscription in AzureCrpClient(sm_generic_credentials).list_subscriptions()
+    access_added = maybe_add_access(app, subscription_id, [
+        CandidateSubscription(default_tenant, subscription, default_tenant_creds)
+        for subscription in AzureCrpClient(default_tenant_creds).list_subscriptions()
     ])
 
+    print([dict(s) for s in AzureCrpClient(default_tenant_creds).list_subscriptions()])
+
+    if access_added:
+        return
+
     # Step 2: List the Tenants this user has access to
-    tenants = AzureCrpClient(sm_generic_credentials).list_tenants()
+    tenants = AzureCrpClient(default_tenant_creds).list_tenants()
 
     # Step 3: For each Tenant, obtain an Azure Service Management token for the tenant, and use it to list
     # subscriptions.
@@ -116,33 +116,22 @@ def main(app_client_id, app_client_secret, live):
     # for the tenant credentials *once again*.
     all_subscription_candidates = []
 
+    # In interactive mode, consider asking the tenant for their name and hitting that tenant directly
     for tenant in tenants :
         logger.info("Listing subscriptions in Tenant: %s", tenant.tenantId)
 
         # Step 3.a: Get an access token for the Tenant so we can list subscriptions in it.
-        sm_tenant_credentials = app.get_credentials_for_resource(tenant.tenantId, SERVICE_MANAGEMENT_RESOURCE,
-                                                                 **extra)
+        tenant_credentials = app.get_credentials_for_resource(tenant.tenantId, SERVICE_MANAGEMENT_RESOURCE,
+                                                              **extra)
 
         # Step 3.b: Use this access token to list the Subscriptions that exist within the Tenant.
-        subscriptions = AzureCrpClient(sm_tenant_credentials).list_subscriptions() # TODO - Rename this object.
-        all_subscription_candidates.extend([CandidateSubscription(tenant, subscription)
+        subscriptions = AzureCrpClient(tenant_credentials).list_subscriptions() # TODO - Rename this object.
+        all_subscription_candidates.extend([CandidateSubscription(tenant, subscription, tenant_credentials)
                                          for subscription in subscriptions])
 
 
     # Step 4: Go through the Subscriptions and identify the one the user wants to use.
-    prompt_for_access_on_subscriptions(app, extra, all_subscription_candidates)
-
-    # !!! THIS ONLY WORKS FOR ADMINISTRATORS !!! #
-    #print(ad_client.get_tenant_name())
-
-    # "Grant contributor Role on the subscription"
-    # getRoleId ("ID of the 'contributor' Role")... and then:
-    # grantRoleToServicePrincipalOnSubscription
-    # -> graph call
-
-    # Graph call will also
-    # I can make a request *without* a resource parameter (and get an authorization code).
-    # Then, I can use the refresh token to get an access token to another resource.
+    maybe_add_access(app, subscription_id, all_subscription_candidates)
 
 
 if __name__ == "__main__":
@@ -151,11 +140,16 @@ if __name__ == "__main__":
 
     for name in ["requests", "werkzeug", "oauth2client"]:
         logging.getLogger(name).setLevel(logging.WARNING)
+    logging.getLogger("azure.auth").setLevel(logging.INFO)
 
     parser = argparse.ArgumentParser("azure-authenticate")
+
     parser.add_argument("app_client_id")
     parser.add_argument("app_client_secret")
+    parser.add_argument("subscription_id", help="Id of the subscription you'd like to register")
+
     parser.add_argument("--live", action="store_true", help="Whether this user is a live.com user or organization")
+    parser.add_argument("--directory", help="Provide a directory name to use")
 
     ns = parser.parse_args()
-    main(ns.app_client_id, ns.app_client_secret, ns.live)
+    main(ns.app_client_id, ns.app_client_secret, ns.subscription_id, ns.live, ns.directory)
