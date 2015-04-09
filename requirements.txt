@@ -1,0 +1,4 @@
+requests
+oauth2client
+flask
+attrdict
