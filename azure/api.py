@@ -19,6 +19,12 @@ DEFAULT_RETRY_DELAY = 1
 RETRY_BACKOFF_FACTOR = 1.5
 
 
+def _vm_expand_params(expand):
+    params = {}
+    if expand:
+        params.update({"$expand": "instanceView"})
+    return params
+
 
 class AzureObject(attrdict.AttrDict):
     @property
@@ -28,7 +34,7 @@ class AzureObject(attrdict.AttrDict):
 
 
 def make_serializable_dict(d):
-    if not isinstance(d, (dict, attrdict.AttrDict)):
+    if not isinstance(d, (dict, attrdict.AttrDict, AzureObject)):
         return d
 
     new = {}
@@ -68,7 +74,6 @@ class BaseAzureClient(requests.Session):
         if request.json:
             request.headers["Content-Type"] = "application/json"
             request.json = make_serializable_dict(request.json)
-
 
         return super().prepare_request(request)
 
@@ -256,15 +261,15 @@ class AzureSubscriptionClient(AzureCrpClient):
     def delete_virtual_machine(self, rg, name):
         return self.delete("{rg.uri}/providers/Microsoft.Compute/virtualMachines/{name}".format(rg=rg, name=name))
 
-    def list_virtual_machines(self, rg):
-        return self.list("{rg.uri}/providers/Microsoft.Compute/virtualMachines/".format(rg=rg))
+    def list_virtual_machines(self, rg, expand=False):
+        return self.list("{rg.uri}/providers/Microsoft.Compute/virtualMachines/".format(rg=rg),
+                         params=_vm_expand_params(expand))
 
     def get_virtual_machine(self, rg, name, model=False):
         url = "{rg.uri}/providers/Microsoft.Compute/virtualMachines/{name}".format(rg=rg, name=name)
         if not model:
             url += "/instanceView"
-        return self.get(url)
-
+        return self.get(url, params=_vm_expand_params(model))  # If you're asking for the model, then yo might want those
 
     # Service Principal Assignment #
 
