@@ -78,7 +78,7 @@ class BaseAzureClient(requests.Session):
         suppress_errors = kwargs.pop("suppress_errors", [])
 
         res = super().request(*args, **kwargs)
-        logger.debug("%s: %s",  " ".join(args), res.status_code)
+        logger.debug("%s %s: %s",  " ".join(args), kwargs.get("params", ""), res.status_code)
 
         # Now, check for errors. We do this before raising to be able to log errors.
         try:
