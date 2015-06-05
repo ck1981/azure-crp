@@ -162,7 +162,7 @@ class AzureCrpClient(BaseAzureClient):
     def _get_api_version(self, request):
         for ns in ["Compute", "Network", "Storage"]:
             if "/Microsoft.{0}/".format(ns) in request.url:
-                return "2014-12-01-preview"
+                return "2015-05-01-preview"
         for ns in ["Authorization"]:
             if "/Microsoft.{0}/".format(ns) in request.url:
                 return "2014-10-01-preview"
